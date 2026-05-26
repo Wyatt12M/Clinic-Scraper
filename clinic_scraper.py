@@ -1,13 +1,15 @@
 """
 Google Maps Places scraper for men's health/TRT/hormone clinics in DFW.
-Exports results to clinic_leads.csv and optionally pushes to Notion.
+Enriches each clinic with owner contact info via Apollo.io.
+Exports to clinic_leads.csv and optionally pushes to Notion.
 
 Dependencies:
     pip install -r requirements.txt
 
 Usage:
     export GOOGLE_MAPS_API_KEY="your_key_here"
-    export NOTION_API_TOKEN="your_notion_token"
+    export APOLLO_API_KEY="your_apollo_key_here"
+    export NOTION_API_TOKEN="your_notion_token"   # only needed for --notion
 
     python clinic_scraper.py               # CSV only
     python clinic_scraper.py --notion      # CSV + push to Notion
@@ -17,6 +19,7 @@ import argparse
 import csv
 import os
 import time
+from urllib.parse import urlparse
 import requests
 
 # ---------------------------------------------------------------------------
@@ -24,6 +27,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY")
 NOTION_API_TOKEN = os.environ.get("NOTION_API_TOKEN")
 NOTION_DATABASE_ID = "740eccd78eda458c8e1b83c39787e68f"
 
@@ -42,10 +46,28 @@ RADIUS_METERS = 80_000
 PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 PLACES_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 
+APOLLO_PEOPLE_SEARCH_URL = "https://api.apollo.io/v1/mixed_people/search"
+
 NOTION_API_URL = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 OUTPUT_FILE = "clinic_leads.csv"
+CSV_FIELDS = [
+    "Name", "Address", "Phone", "Website",
+    "Owner Name", "Owner Title", "Owner Email", "Owner Phone", "Owner LinkedIn",
+]
+
+# Job titles Apollo will match against — ordered from most to least specific
+OWNER_TITLES = [
+    "Owner",
+    "Founder",
+    "Co-Founder",
+    "CEO",
+    "Chief Executive Officer",
+    "President",
+    "Medical Director",
+    "Clinic Director",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +119,85 @@ def get_place_details(place_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Apollo.io helpers
+# ---------------------------------------------------------------------------
+
+def extract_domain(url: str) -> str | None:
+    """Return bare domain from a URL, e.g. 'https://www.example.com/path' -> 'example.com'."""
+    if not url:
+        return None
+    try:
+        host = urlparse(url).hostname or ""
+        return host.removeprefix("www.") or None
+    except Exception:
+        return None
+
+
+def apollo_find_owner(domain: str | None, company_name: str) -> dict:
+    """
+    Search Apollo for the highest-ranking owner/founder/exec at a clinic.
+    Returns a dict with owner_name, owner_title, owner_email, owner_phone, owner_linkedin.
+    Falls back to empty strings if nothing is found.
+    """
+    empty = {
+        "Owner Name": "", "Owner Title": "",
+        "Owner Email": "", "Owner Phone": "", "Owner LinkedIn": "",
+    }
+
+    if not APOLLO_API_KEY:
+        return empty
+
+    payload: dict = {
+        "api_key": APOLLO_API_KEY,
+        "person_titles": OWNER_TITLES,
+        "per_page": 5,
+        "page": 1,
+    }
+
+    if domain:
+        payload["q_organization_domains"] = domain
+    else:
+        payload["q_keywords"] = company_name
+
+    try:
+        resp = requests.post(APOLLO_PEOPLE_SEARCH_URL, json=payload, timeout=15)
+        if resp.status_code == 429:
+            print("  Apollo rate limit hit — waiting 60 s...")
+            time.sleep(60)
+            resp = requests.post(APOLLO_PEOPLE_SEARCH_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  Apollo request failed for '{company_name}': {e}")
+        return empty
+
+    people = resp.json().get("people", [])
+    if not people:
+        return empty
+
+    # Pick the person whose title ranks earliest in OWNER_TITLES
+    def title_rank(person: dict) -> int:
+        title = (person.get("title") or "").lower()
+        for i, t in enumerate(OWNER_TITLES):
+            if t.lower() in title:
+                return i
+        return len(OWNER_TITLES)
+
+    best = min(people, key=title_rank)
+
+    # Phone: Apollo returns a list of phone objects
+    phones = best.get("phone_numbers") or []
+    phone = phones[0].get("sanitized_number", "") if phones else ""
+
+    return {
+        "Owner Name": best.get("name", ""),
+        "Owner Title": best.get("title", ""),
+        "Owner Email": best.get("email", ""),
+        "Owner Phone": phone,
+        "Owner LinkedIn": best.get("linkedin_url", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Notion helpers
 # ---------------------------------------------------------------------------
 
@@ -109,23 +210,25 @@ def notion_headers() -> dict:
 
 
 def get_database_schema() -> dict:
-    """Return the property map for the target database."""
     url = f"{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}"
     resp = requests.get(url, headers=notion_headers(), timeout=10)
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"Failed to fetch Notion database ({resp.status_code}): {resp.text}"
-        )
+        raise RuntimeError(f"Failed to fetch Notion database ({resp.status_code}): {resp.text}")
     return resp.json().get("properties", {})
 
 
 def ensure_database_properties(existing: dict) -> None:
-    """Add any missing properties (Address, Phone, Website, Source) to the DB."""
+    """Add any missing properties to the Notion database."""
     needed = {
         "Address": {"rich_text": {}},
         "Phone": {"phone_number": {}},
         "Website": {"url": {}},
         "Source": {"select": {}},
+        "Owner Name": {"rich_text": {}},
+        "Owner Title": {"rich_text": {}},
+        "Owner Email": {"email": {}},
+        "Owner Phone": {"phone_number": {}},
+        "Owner LinkedIn": {"url": {}},
     }
     to_add = {k: v for k, v in needed.items() if k not in existing}
     if not to_add:
@@ -133,27 +236,14 @@ def ensure_database_properties(existing: dict) -> None:
 
     print(f"  Adding missing Notion properties: {list(to_add.keys())}")
     url = f"{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}"
-    resp = requests.patch(
-        url,
-        headers=notion_headers(),
-        json={"properties": to_add},
-        timeout=10,
-    )
+    resp = requests.patch(url, headers=notion_headers(), json={"properties": to_add}, timeout=10)
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"Failed to update Notion database schema ({resp.status_code}): {resp.text}"
-        )
+        raise RuntimeError(f"Failed to update Notion schema ({resp.status_code}): {resp.text}")
 
 
 def page_exists(name: str) -> bool:
-    """Return True if a page with this name already exists in the database."""
     url = f"{NOTION_API_URL}/databases/{NOTION_DATABASE_ID}/query"
-    payload = {
-        "filter": {
-            "property": "Name",
-            "title": {"equals": name},
-        }
-    }
+    payload = {"filter": {"property": "Name", "title": {"equals": name}}}
     resp = requests.post(url, headers=notion_headers(), json=payload, timeout=10)
     if resp.status_code != 200:
         return False
@@ -161,7 +251,6 @@ def page_exists(name: str) -> bool:
 
 
 def push_to_notion(row: dict, source_term: str) -> None:
-    """Create a page in the Notion database for one clinic row."""
     if page_exists(row["Name"]):
         print(f"  Skipping (already in Notion): {row['Name']}")
         return
@@ -169,27 +258,27 @@ def push_to_notion(row: dict, source_term: str) -> None:
     properties: dict = {
         "Name": {"title": [{"text": {"content": row["Name"]}}]},
     }
-    if row.get("Address"):
-        properties["Address"] = {
-            "rich_text": [{"text": {"content": row["Address"]}}]
-        }
+
+    rich_text_fields = ["Address", "Owner Name", "Owner Title"]
+    for field in rich_text_fields:
+        if row.get(field):
+            properties[field] = {"rich_text": [{"text": {"content": row[field]}}]}
+
     if row.get("Phone"):
         properties["Phone"] = {"phone_number": row["Phone"]}
     if row.get("Website"):
         properties["Website"] = {"url": row["Website"]}
+    if row.get("Owner Email"):
+        properties["Owner Email"] = {"email": row["Owner Email"]}
+    if row.get("Owner Phone"):
+        properties["Owner Phone"] = {"phone_number": row["Owner Phone"]}
+    if row.get("Owner LinkedIn"):
+        properties["Owner LinkedIn"] = {"url": row["Owner LinkedIn"]}
     if source_term:
         properties["Source"] = {"select": {"name": source_term}}
 
-    payload = {
-        "parent": {"database_id": NOTION_DATABASE_ID},
-        "properties": properties,
-    }
-    resp = requests.post(
-        f"{NOTION_API_URL}/pages",
-        headers=notion_headers(),
-        json=payload,
-        timeout=10,
-    )
+    payload = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties}
+    resp = requests.post(f"{NOTION_API_URL}/pages", headers=notion_headers(), json=payload, timeout=10)
     if resp.status_code != 200:
         print(f"  Error pushing '{row['Name']}' to Notion ({resp.status_code}): {resp.text}")
     else:
@@ -202,15 +291,13 @@ def push_to_notion(row: dict, source_term: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Scrape DFW men's health clinics.")
-    parser.add_argument(
-        "--notion",
-        action="store_true",
-        help="Push results to Notion in addition to saving CSV.",
-    )
+    parser.add_argument("--notion", action="store_true", help="Push results to Notion.")
     args = parser.parse_args()
 
     if not GOOGLE_MAPS_API_KEY:
         raise EnvironmentError("GOOGLE_MAPS_API_KEY environment variable is not set.")
+    if not APOLLO_API_KEY:
+        print("Warning: APOLLO_API_KEY not set — owner contact fields will be empty.")
 
     if args.notion:
         if not NOTION_API_TOKEN:
@@ -221,8 +308,9 @@ def main():
 
     seen_place_ids: set[str] = set()
     rows: list[dict] = []
-    source_map: dict[str, str] = {}  # name -> first search term that found it
+    source_map: dict[str, str] = {}
 
+    # --- Phase 1: Google Maps scrape ---
     for term in SEARCH_TERMS:
         print(f"\nSearching: {term} ...")
         places = text_search(term)
@@ -246,21 +334,40 @@ def main():
                 "Address": details.get("formatted_address") or place.get("formatted_address", ""),
                 "Phone": details.get("formatted_phone_number", ""),
                 "Website": details.get("website", ""),
+                "Owner Name": "",
+                "Owner Title": "",
+                "Owner Email": "",
+                "Owner Phone": "",
+                "Owner LinkedIn": "",
             }
             rows.append(row)
             source_map[row["Name"]] = term
 
         time.sleep(1)
 
-    # Write CSV
+    print(f"\nFound {len(rows)} unique clinics. Starting owner enrichment via Apollo...")
+
+    # --- Phase 2: Apollo enrichment ---
+    for i, row in enumerate(rows, 1):
+        print(f"  [{i}/{len(rows)}] {row['Name']}")
+        domain = extract_domain(row["Website"])
+        owner = apollo_find_owner(domain, row["Name"])
+        row.update(owner)
+        if owner["Owner Name"]:
+            print(f"    -> {owner['Owner Name']} ({owner['Owner Title']}) {owner['Owner Email']}")
+        else:
+            print("    -> No owner found")
+        time.sleep(0.5)  # stay within Apollo rate limits
+
+    # --- Write CSV ---
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["Name", "Address", "Phone", "Website"])
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
 
     print(f"\nSaved {len(rows)} clinics to {OUTPUT_FILE}")
 
-    # Push to Notion
+    # --- Push to Notion ---
     if args.notion:
         print("\nPushing to Notion...")
         for row in rows:
